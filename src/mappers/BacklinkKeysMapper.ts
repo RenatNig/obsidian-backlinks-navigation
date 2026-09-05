@@ -1,10 +1,178 @@
-import { App, TFile, View } from "obsidian";
+import { App, MarkdownView, TFile, View } from "obsidian";
 import { KeysMapper } from "../types";
+
+/**
+ * A path to the focused element that survives a re-render of the pane.
+ */
+interface FocusAnchor {
+	/** Path of the note the pane was showing the backlinks for. */
+	sourcePath: string;
+	/** Path (or title) of the backlinked file the element belongs to. */
+	fileKey: string;
+	/** Position of the element among the elements of that very file. */
+	offset: number;
+}
 
 export class BacklinkKeysMapper implements KeysMapper {
 	private static readonly FOCUSED_CLASS = "backlink-nav-backlink-focused";
 
+	// Backlinks are rendered asynchronously, so the very first focus attempt made right after the
+	// pane becomes active may still find an empty result list.
+	private static readonly FOCUS_RETRY_DELAY_MS = 50;
+	private static readonly FOCUS_RETRY_ATTEMPTS = 6;
+
+	private focusRetryTimeoutId: number | null = null;
+	private lastFocusAnchor: FocusAnchor | null = null;
+
 	constructor(private app: App) {}
+
+	/**
+	 * The pane became the active one: put the marker back where the user left it (or on the first
+	 * link) right away, so navigation can start without pressing Down/J first.
+	 */
+	public onViewFocus(containerEl: HTMLElement | null): void {
+		this.cancelPendingFocus();
+		this.restoreFocus(containerEl, 0);
+	}
+
+	/**
+	 * The focus moved to another pane: the marker must not linger, otherwise two panes look focused
+	 * at the same time and the next key press would act on a pane the user has already left.
+	 */
+	public onViewBlur(): void {
+		this.cancelPendingFocus();
+
+		document
+			.querySelectorAll<HTMLElement>(`.${BacklinkKeysMapper.FOCUSED_CLASS}`)
+			.forEach((el) => {
+				el.classList.remove(BacklinkKeysMapper.FOCUSED_CLASS);
+
+				if (document.activeElement === el) {
+					el.blur();
+				}
+			});
+	}
+
+	public dispose(): void {
+		this.onViewBlur();
+		this.lastFocusAnchor = null;
+	}
+
+	private cancelPendingFocus(): void {
+		if (this.focusRetryTimeoutId != null) {
+			window.clearTimeout(this.focusRetryTimeoutId);
+			this.focusRetryTimeoutId = null;
+		}
+	}
+
+	private restoreFocus(containerEl: HTMLElement | null, attempt: number): void {
+		this.focusRetryTimeoutId = null;
+
+		if (this.tryRestoreFocus(containerEl)) {
+			return;
+		}
+
+		// The pane may legitimately have no backlinks at all, so the retries are bounded.
+		if (attempt >= BacklinkKeysMapper.FOCUS_RETRY_ATTEMPTS) {
+			return;
+		}
+
+		this.focusRetryTimeoutId = window.setTimeout(() => {
+			this.restoreFocus(containerEl, attempt + 1);
+		}, BacklinkKeysMapper.FOCUS_RETRY_DELAY_MS);
+	}
+
+	private tryRestoreFocus(containerEl: HTMLElement | null): boolean {
+		const backlinksContainerEl = containerEl ?? this.getBacklinksContainerEl();
+		if (backlinksContainerEl == null) {
+			return false;
+		}
+
+		const items = this.getNavigableElements(backlinksContainerEl);
+		const firstEl = items[0];
+		if (firstEl == null) {
+			return false;
+		}
+
+		// Something inside the pane is already focused — keep it instead of jumping around.
+		if (this.getCurrentIndex(backlinksContainerEl, items) != null) {
+			return true;
+		}
+
+		this.focusElement(backlinksContainerEl, this.findAnchoredElement(items) ?? firstEl, items);
+		return true;
+	}
+
+	/**
+	 * The position is remembered as a path to the element — the backlinked file plus the offset
+	 * inside its matches — and not as a plain index: the pane re-renders on every vault change,
+	 * so a bare index would drift onto an unrelated link.
+	 */
+	private rememberFocus(items: HTMLElement[], el: HTMLElement): void {
+		const index = items.indexOf(el);
+
+		for (let titleIndex = index; titleIndex >= 0; titleIndex--) {
+			const fileKey = this.getFileKey(items[titleIndex]);
+			if (fileKey == null) {
+				continue;
+			}
+
+			this.lastFocusAnchor = {
+				sourcePath: this.getSourcePath(),
+				fileKey,
+				offset: index - titleIndex,
+			};
+			return;
+		}
+
+		this.lastFocusAnchor = null;
+	}
+
+	private findAnchoredElement(items: HTMLElement[]): HTMLElement | null {
+		const anchor = this.lastFocusAnchor;
+
+		// The pane follows the active note, so the backlinks of another note start from the top.
+		if (anchor == null || anchor.sourcePath !== this.getSourcePath()) {
+			return null;
+		}
+
+		const titleIndex = items.findIndex((item) => this.getFileKey(item) === anchor.fileKey);
+		if (titleIndex === -1) {
+			return null;
+		}
+
+		// The file may have fewer matches by now (or be collapsed), so the offset is clamped to the
+		// last element that still belongs to that very same file.
+		const nextTitleOffset = items
+			.slice(titleIndex + 1)
+			.findIndex((item) => this.getFileKey(item) != null);
+		const lastIndex = nextTitleOffset === -1 ? items.length - 1 : titleIndex + nextTitleOffset;
+
+		return items[Math.min(titleIndex + anchor.offset, lastIndex)] ?? null;
+	}
+
+	/**
+	 * Non-null only for the elements that represent a backlinked file, so they can act as anchors.
+	 */
+	private getFileKey(el: HTMLElement | undefined): string | null {
+		const titleEl =
+			el?.closest<HTMLElement>(".search-result-file-title") ??
+			el?.querySelector<HTMLElement>(".search-result-file-title");
+		if (titleEl == null) {
+			return null;
+		}
+
+		const fileKey =
+			titleEl.getAttribute("data-path") ??
+			titleEl.getAttribute("data-href") ??
+			titleEl.textContent?.trim();
+
+		return fileKey === "" || fileKey == null ? null : fileKey;
+	}
+
+	private getSourcePath(): string {
+		return this.app.workspace.getActiveFile()?.path ?? "";
+	}
 
 	public async handleKeyPress(event: KeyboardEvent): Promise<void> {
 		switch (event.code) {
@@ -29,7 +197,33 @@ export class BacklinkKeysMapper implements KeysMapper {
 				await this.openInBackgroundTab();
 				break;
 			}
+			case "Escape": {
+				event.preventDefault();
+				this.returnFocusToEditor();
+				break;
+			}
 			default:
+		}
+	}
+
+	/**
+	 * Keyboard-only navigation needs a way out of the pane: Escape drops the marker and hands the
+	 * focus back to the note in the main area. The remembered position survives, so coming back
+	 * continues from the same link.
+	 */
+	private returnFocusToEditor(): void {
+		this.onViewBlur();
+
+		const leaf = this.app.workspace.getMostRecentLeaf();
+		if (leaf == null) {
+			return;
+		}
+
+		this.app.workspace.setActiveLeaf(leaf, { focus: true });
+
+		// Activating the leaf is not always enough for a note: the caret has to be placed explicitly.
+		if (leaf.view instanceof MarkdownView) {
+			leaf.view.editor.focus();
 		}
 	}
 
@@ -55,7 +249,7 @@ export class BacklinkKeysMapper implements KeysMapper {
 		if (el == null) {
 			return;
 		}
-		this.focusElement(containerEl, el);
+		this.focusElement(containerEl, el, items);
 	}
 
 	private openFocused(event: KeyboardEvent): void {
@@ -261,9 +455,10 @@ export class BacklinkKeysMapper implements KeysMapper {
 		});
 	}
 
-	private focusElement(containerEl: HTMLElement, el: HTMLElement): void {
+	private focusElement(containerEl: HTMLElement, el: HTMLElement, items: HTMLElement[]): void {
 		this.clearMarker(containerEl);
 		el.classList.add(BacklinkKeysMapper.FOCUSED_CLASS);
+		this.rememberFocus(items, el);
 
 		// Ensure programmatic focus works even if element isn't tabbable by default.
 		if (el.tabIndex < 0) {

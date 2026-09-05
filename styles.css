@@ -1,6 +1,12 @@
-.backlink-nav-backlink-focused {
-	outline: 2px solid var(--interactive-accent);
-	outline-offset: 2px;
-	border-radius: 4px;
-	background-color: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+/*
+ * Mirrors the native File Explorer focus style (`.tree-item-self.has-focus`):
+ * a plain grey frame, without accent color or background tint.
+ * The `:focus` overrides keep the browser/Obsidian focus ring from doubling it.
+ */
+.backlink-nav-backlink-focused,
+.backlink-nav-backlink-focused:focus,
+.backlink-nav-backlink-focused:focus-visible {
+	box-shadow: 0 0 0 2px var(--background-modifier-border-focus);
+	border-radius: var(--radius-s);
+	outline: none;
 }

@@ -1,6 +1,6 @@
 import { BacklinkKeysMapper } from "./mappers/BacklinkKeysMapper";
 import { KeysMapper, ViewType } from "./types";
-import { View, Plugin } from "obsidian";
+import { View, Plugin, WorkspaceLeaf } from "obsidian";
 
 export default class BacklinksKeyboardNav extends Plugin {
   private keysMappers: Record<string, KeysMapper> = {} as Record<
@@ -9,9 +9,9 @@ export default class BacklinksKeyboardNav extends Plugin {
   >;
   private backlinkKeysMapper!: BacklinkKeysMapper;
 
-  // Keydown events in some panes may be stopped before reaching the bubbling phase,
+  // Keydown and focus events in some panes may be stopped before reaching the bubbling phase,
   // so we listen in capture phase for reliability.
-  private static readonly KEYDOWN_CAPTURE = true;
+  private static readonly CAPTURE_PHASE = true;
 
   public async onload(): Promise<void> {
     this.backlinkKeysMapper = new BacklinkKeysMapper(this.app);
@@ -24,7 +24,20 @@ export default class BacklinksKeyboardNav extends Plugin {
     document.addEventListener(
       "keydown",
       this.handleKeyPress,
-      BacklinksKeyboardNav.KEYDOWN_CAPTURE,
+      BacklinksKeyboardNav.CAPTURE_PHASE,
+    );
+
+    // Focus routing needs both signals: `active-leaf-change` covers command/hotkey driven switches
+    // that never move the DOM focus, `focusin` covers clicks inside a pane that do not always
+    // change the active leaf (sidebar panes in particular).
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", this.handleActiveLeafChange),
+    );
+    this.registerDomEvent(
+      document,
+      "focusin",
+      this.handleFocusIn,
+      BacklinksKeyboardNav.CAPTURE_PHASE,
     );
   }
 
@@ -32,8 +45,12 @@ export default class BacklinksKeyboardNav extends Plugin {
     document.removeEventListener(
       "keydown",
       this.handleKeyPress,
-      BacklinksKeyboardNav.KEYDOWN_CAPTURE,
+      BacklinksKeyboardNav.CAPTURE_PHASE,
     );
+
+    for (const mappedViewType of Object.keys(this.keysMappers)) {
+      this.keysMappers[mappedViewType]?.dispose?.();
+    }
   }
 
   private handleKeyPress = (event: KeyboardEvent): void => {
@@ -54,6 +71,56 @@ export default class BacklinksKeyboardNav extends Plugin {
       })
       .catch(console.error);
   };
+
+  private handleActiveLeafChange = (leaf: WorkspaceLeaf | null): void => {
+    const view = leaf?.view;
+
+    this.syncActiveView(
+      this.normalizeViewType(view?.getViewType()),
+      view?.containerEl ?? null,
+      true,
+    );
+  };
+
+  private handleFocusIn = (event: FocusEvent): void => {
+    const { hasLeafContext, viewType, leafContentEl } =
+      this.inferViewTypeFromDomTarget(event.target);
+
+    // Focus went somewhere outside of the panes (ribbon, modal, status bar) — the pane that was
+    // active before is still the one the user works with, so the current state is kept.
+    if (!hasLeafContext) {
+      return;
+    }
+
+    this.syncActiveView(
+      viewType,
+      leafContentEl,
+      // Never steal the focus from a text field, e.g. the Backlinks search filter.
+      !BacklinksKeyboardNav.checkIsEditableTarget(event.target),
+    );
+  };
+
+  /**
+   * The single entry point for focus routing: the mapper of the newly active pane may take the
+   * focus, every other mapper drops its focus marker so that only one pane ever looks focused.
+   */
+  private syncActiveView(
+    viewType: string | null,
+    containerEl: HTMLElement | null,
+    allowFocusTakeover: boolean,
+  ): void {
+    for (const mappedViewType of Object.keys(this.keysMappers)) {
+      if (mappedViewType !== viewType) {
+        this.keysMappers[mappedViewType]?.onViewBlur?.();
+      }
+    }
+
+    if (viewType == null || !allowFocusTakeover) {
+      return;
+    }
+
+    this.keysMappers[viewType]?.onViewFocus?.(containerEl);
+  }
 
   private getViewTypeFromEvent(event: KeyboardEvent): string | null {
     const targetView = this.inferViewTypeFromDomTarget(event.target);
@@ -92,9 +159,10 @@ export default class BacklinksKeyboardNav extends Plugin {
   private inferViewTypeFromDomTarget(target: EventTarget | null): {
     hasLeafContext: boolean;
     viewType: string | null;
+    leafContentEl: HTMLElement | null;
   } {
     if (!(target instanceof HTMLElement)) {
-      return { hasLeafContext: false, viewType: null };
+      return { hasLeafContext: false, viewType: null, leafContentEl: null };
     }
 
     // Obsidian sets `data-type` on leaf content containers.
@@ -102,14 +170,28 @@ export default class BacklinksKeyboardNav extends Plugin {
       ".workspace-leaf-content[data-type]",
     );
     if (leafContent == null) {
-      return { hasLeafContext: false, viewType: null };
+      return { hasLeafContext: false, viewType: null, leafContentEl: null };
     }
 
     const dataType = leafContent.getAttribute("data-type");
     return {
       hasLeafContext: true,
       viewType: this.normalizeViewType(dataType),
+      leafContentEl: leafContent,
     };
+  }
+
+  private static checkIsEditableTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) {
+      return false;
+    }
+
+    return (
+      target.isContentEditable ||
+      target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.tagName === "SELECT"
+    );
   }
 
   /**
@@ -120,6 +202,11 @@ export default class BacklinksKeyboardNav extends Plugin {
     // Ignore synthetic events dispatched by the plugin itself (e.g. Arrow keys for Backlinks/File Explorer),
     // so we don't accidentally re-handle them and interfere with native Obsidian behavior.
     if (!event.isTrusted) {
+      return false;
+    }
+
+    // Typing in a text field (e.g. the Backlinks search filter) must not trigger navigation.
+    if (BacklinksKeyboardNav.checkIsEditableTarget(event.target)) {
       return false;
     }
 
