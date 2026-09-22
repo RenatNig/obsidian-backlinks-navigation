@@ -13,6 +13,12 @@ export default class BacklinksKeyboardNav extends Plugin {
   // so we listen in capture phase for reliability.
   private static readonly CAPTURE_PHASE = true;
 
+  // A pointer gesture is the user aiming at an exact spot. Taking the focus over in the middle of
+  // one scrolls the list from under the cursor and swallows the click, so no takeover happens
+  // until the gesture — the trailing `click` included — is over.
+  private isPointerGestureActive = false;
+  private pointerGestureResetTimeoutId: number | null = null;
+
   public async onload(): Promise<void> {
     this.backlinkKeysMapper = new BacklinkKeysMapper(this.app);
     this.keysMappers = {
@@ -39,6 +45,27 @@ export default class BacklinksKeyboardNav extends Plugin {
       this.handleFocusIn,
       BacklinksKeyboardNav.CAPTURE_PHASE,
     );
+
+    // Clicks are an explicit aim at a concrete link and must never be overridden — see
+    // `isPointerGestureActive`.
+    this.registerDomEvent(
+      document,
+      "pointerdown",
+      this.handlePointerDown,
+      BacklinksKeyboardNav.CAPTURE_PHASE,
+    );
+    this.registerDomEvent(
+      document,
+      "pointerup",
+      this.handlePointerGestureEnd,
+      BacklinksKeyboardNav.CAPTURE_PHASE,
+    );
+    this.registerDomEvent(
+      document,
+      "pointercancel",
+      this.handlePointerGestureEnd,
+      BacklinksKeyboardNav.CAPTURE_PHASE,
+    );
   }
 
   public onunload() {
@@ -48,12 +75,46 @@ export default class BacklinksKeyboardNav extends Plugin {
       BacklinksKeyboardNav.CAPTURE_PHASE,
     );
 
+    this.cancelPointerGestureReset();
+
     for (const mappedViewType of Object.keys(this.keysMappers)) {
       this.keysMappers[mappedViewType]?.dispose?.();
     }
   }
 
+  private handlePointerDown = (): void => {
+    this.isPointerGestureActive = true;
+    this.cancelPointerGestureReset();
+
+    // A takeover scheduled by an earlier leaf change must not fire mid-gesture either.
+    for (const mappedViewType of Object.keys(this.keysMappers)) {
+      this.keysMappers[mappedViewType]?.cancelPendingFocus?.();
+    }
+  };
+
+  private handlePointerGestureEnd = (): void => {
+    this.cancelPointerGestureReset();
+
+    // `click` is dispatched after `pointerup` and Obsidian may activate the leaf from it, so the
+    // gesture only counts as finished once the current task is done.
+    this.pointerGestureResetTimeoutId = window.setTimeout(() => {
+      this.pointerGestureResetTimeoutId = null;
+      this.isPointerGestureActive = false;
+    }, 0);
+  };
+
+  private cancelPointerGestureReset(): void {
+    if (this.pointerGestureResetTimeoutId != null) {
+      window.clearTimeout(this.pointerGestureResetTimeoutId);
+      this.pointerGestureResetTimeoutId = null;
+    }
+  }
+
   private handleKeyPress = (event: KeyboardEvent): void => {
+    // Safety net: a pointer released outside the window may leave the gesture flag stuck, and a key
+    // press proves the user is no longer dragging anything.
+    this.isPointerGestureActive = false;
+
     Promise.resolve()
       .then(() => {
         const activeViewType = this.getViewTypeFromEvent(event);
@@ -78,7 +139,7 @@ export default class BacklinksKeyboardNav extends Plugin {
     this.syncActiveView(
       this.normalizeViewType(view?.getViewType()),
       view?.containerEl ?? null,
-      true,
+      !this.isPointerGestureActive,
     );
   };
 
@@ -95,8 +156,10 @@ export default class BacklinksKeyboardNav extends Plugin {
     this.syncActiveView(
       viewType,
       leafContentEl,
-      // Never steal the focus from a text field, e.g. the Backlinks search filter.
-      !BacklinksKeyboardNav.checkIsEditableTarget(event.target),
+      // Never steal the focus from a click in progress or from a text field, e.g. the Backlinks
+      // search filter.
+      !this.isPointerGestureActive &&
+        !BacklinksKeyboardNav.checkIsEditableTarget(event.target),
     );
   };
 

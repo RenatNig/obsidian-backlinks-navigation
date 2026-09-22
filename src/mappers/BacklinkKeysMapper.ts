@@ -58,7 +58,7 @@ export class BacklinkKeysMapper implements KeysMapper {
 		this.lastFocusAnchor = null;
 	}
 
-	private cancelPendingFocus(): void {
+	public cancelPendingFocus(): void {
 		if (this.focusRetryTimeoutId != null) {
 			window.clearTimeout(this.focusRetryTimeoutId);
 			this.focusRetryTimeoutId = null;
@@ -472,9 +472,17 @@ export class BacklinkKeysMapper implements KeysMapper {
 	private getCurrentIndex(containerEl: HTMLElement, items: HTMLElement[]): number | null {
 		const active = document.activeElement;
 		if (active instanceof HTMLElement) {
-			const idx = items.indexOf(active);
-			if (idx !== -1) {
-				return idx;
+			// The focus usually lands on a child of an item (a span inside a match line, the inner
+			// title element), so the nearest item up the tree counts as the current one.
+			for (
+				let el: HTMLElement | null = active;
+				el != null && el !== containerEl;
+				el = el.parentElement
+			) {
+				const idx = items.indexOf(el);
+				if (idx !== -1) {
+					return idx;
+				}
 			}
 		}
 

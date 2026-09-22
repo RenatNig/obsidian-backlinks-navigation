@@ -14,6 +14,12 @@ export interface KeysMapper {
 	onViewBlur?(): void;
 
 	/**
+	 * Called when the user starts a pointer gesture: a focus takeover that is still pending must be
+	 * abandoned, otherwise it fires in the middle of a click.
+	 */
+	cancelPendingFocus?(): void;
+
+	/**
 	 * Called on plugin unload: cancel pending work and clean up the DOM.
 	 */
 	dispose?(): void;
